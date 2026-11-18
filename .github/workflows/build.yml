@@ -100,17 +100,23 @@ jobs:
         run: |
           set -euo pipefail
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          # rustup 生成的是 env（不是 env 可执行文件），必须 source
+          . "$HOME/.cargo/env"
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          source "$HOME/.cargo/bin/env"
+          rustc --version
+          cargo --version
           rustup target add aarch64-linux-android
-          # Java 17
           sudo apt-get install -y -qq openjdk-17-jdk
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
-          # Flutter（上游 pubspec 要求 sdk ^3.10.8）
-          git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$HOME/flutter" 2>/dev/null || true
+          # Flutter：上游 pubspec 要求 sdk ^3.10.8，取 stable 频道
+          if [ ! -d "$HOME/flutter" ]; then
+            git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$HOME/flutter"
+          fi
           echo "$HOME/flutter/bin" >> $GITHUB_PATH
-          "$HOME/flutter/bin/flutter" --version
-          "$HOME/flutter/bin/flutter" config --no-analytics
+          export PATH="$HOME/flutter/bin:$PATH"
+          flutter --version
+          flutter config --no-analytics
+          flutter precache --android || true
 
       - name: 构建 Android 运行时
         run: |
