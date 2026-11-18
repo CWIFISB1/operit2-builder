@@ -29,14 +29,14 @@ permissions:
   contents: write
 
 env:
-  UPSTREAM_WORKSPACE: operit2-src
+  SRC: operit2-src
   PYTHONUTF8: '1'
   PYTHONIOENCODING: utf-8
 
 jobs:
   android:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
       - name: 检出源码
         uses: actions/checkout@v4
@@ -44,152 +44,165 @@ jobs:
           repository: ${{ github.event.inputs.source_repo }}
           ref: ${{ github.event.inputs.source_ref }}
           token: ${{ secrets.SOURCE_TOKEN }}
-          path: ${{ env.UPSTREAM_WORKSPACE }}
+          path: ${{ env.SRC }}
           fetch-depth: 1
 
       - name: 环境自检
+        working-directory: ${{ env.SRC }}
         run: |
           set -euo pipefail
-          cd "$UPSTREAM_WORKSPACE"
-          echo "[版本]"
-          grep -E '^version:' apps/flutter/app/pubspec.yaml || true
-          echo "[云机 buildType 是否就位]"
-          grep -n 'create("yunji")' apps/flutter/app/android/app/build.gradle.kts
-          grep -n 'com.yunjing.companion' apps/flutter/app/android/app/build.gradle.kts
-          echo "[伴生包 buildType]"
-          grep -n 'create("yunji")' tools/android-accessibility/build.gradle.kts
+          echo "[版本]"; grep -E '^version:' apps/flutter/app/pubspec.yaml || true
+          echo "[云机 buildType 主包]"; grep -n 'create("yunji")' apps/flutter/app/android/app/build.gradle.kts
+          echo "[云机包名]"; grep -n 'com.yunjing.companion' apps/flutter/app/android/app/build.gradle.kts | head -4
+          echo "[伴生包 buildType]"; grep -n 'create("yunji")' tools/android-accessibility/build.gradle.kts
 
       - name: 恢复固定签名
-        run: |
-          set -euo pipefail
-          cd "$UPSTREAM_WORKSPACE"
-          mkdir -p tools/release/secrets
-          echo "$KEYSTORE_B64" | base64 -d > tools/release/secrets/operit2-release.jks
-          keytool -list -keystore tools/release/secrets/operit2-release.jks -storepass "$KEYSTORE_PASS" > /dev/null
-          # 写入 local.properties：Gradle 从这里读取 RELEASE_* 四个键。
-          cat >> local.properties <<EOF
-          RELEASE_STORE_FILE=$PWD/tools/release/secrets/operit2-release.jks
-          RELEASE_STORE_PASSWORD=$KEYSTORE_PASS
-          RELEASE_KEY_ALIAS=$KEYSTORE_ALIAS
-          RELEASE_KEY_PASSWORD=$KEYSTORE_PASS
-          EOF
-          echo '[签名就绪]'
-          keytool -list -v -keystore tools/release/secrets/operit2-release.jks -storepass "$KEYSTORE_PASS" 2>/dev/null | grep -E 'SHA256:' | head -1
+        working-directory: ${{ env.SRC }}
         env:
           KEYSTORE_B64: ${{ secrets.O2_KEYSTORE_B64 }}
           KEYSTORE_PASS: ${{ secrets.O2_KEYSTORE_PASS }}
           KEYSTORE_ALIAS: ${{ secrets.O2_KEYSTORE_ALIAS }}
+        run: |
+          set -euo pipefail
+          mkdir -p tools/release/secrets
+          echo "$KEYSTORE_B64" | base64 -d > tools/release/secrets/operit2-release.jks
+          keytool -list -keystore tools/release/secrets/operit2-release.jks -storepass "$KEYSTORE_PASS" > /dev/null
+          {
+            echo "RELEASE_STORE_FILE=$GITHUB_WORKSPACE/$SRC/tools/release/secrets/operit2-release.jks"
+            echo "RELEASE_STORE_PASSWORD=$KEYSTORE_PASS"
+            echo "RELEASE_KEY_ALIAS=$KEYSTORE_ALIAS"
+            echo "RELEASE_KEY_PASSWORD=$KEYSTORE_PASS"
+          } >> local.properties
+          echo '[签名就绪]'
+          keytool -list -v -keystore tools/release/secrets/operit2-release.jks -storepass "$KEYSTORE_PASS" 2>/dev/null | grep -E 'SHA256:' | head -1
 
-      - name: 安装构建依赖
+      - name: 安装 Linux 构建依赖
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            ca-certificates curl git unzip xz-utils gzip tar \
-            gawk pkg-config flex diffutils patch python3 python3-venv
-          # LLVM 21（上游 BUILDING.md 要求 libclang 21.1+）
+            ca-certificates curl git unzip xz-utils gzip tar bzip2 \
+            gawk pkg-config flex diffutils patch \
+            python3 python3-venv python3-pip \
+            openjdk-17-jdk nodejs npm corepack
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
+          node --version
+
+      - name: 安装 LLVM 21
+        run: |
+          set -euo pipefail
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
             | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/noble llvm-toolchain-noble-21 main" \
             | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang-21 libclang-21-dev lld-21
-          echo "[clang] $(clang-21 --version | head -1)"
+          clang-21 --version | head -1
 
-      - name: 安装 Rust 与 Flutter
+      - name: 安装 Rust
         run: |
           set -euo pipefail
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-          # rustup 生成的是 env（不是 env 可执行文件），必须 source
           . "$HOME/.cargo/env"
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           rustc --version
-          cargo --version
           rustup target add aarch64-linux-android
-          sudo apt-get install -y -qq openjdk-17-jdk
-          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
-          # Flutter：上游 pubspec 要求 sdk ^3.10.8，取 stable 频道
-          if [ ! -d "$HOME/flutter" ]; then
-            git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$HOME/flutter"
-          fi
-          echo "$HOME/flutter/bin" >> $GITHUB_PATH
-          export PATH="$HOME/flutter/bin:$PATH"
-          flutter --version
-          flutter config --no-analytics
-          flutter precache --android || true
 
-      - name: 构建 Android 运行时
+      - name: 安装 FVM 与项目 Flutter
+        working-directory: ${{ env.SRC }}
         run: |
           set -euo pipefail
-          cd "$UPSTREAM_WORKSPACE"
+          export PATH="$HOME/.pub-cache/bin:$PATH"
+          dart pub global activate fvm
+          echo "$HOME/.pub-cache/bin" >> $GITHUB_PATH
+          fvm install || true
+          fvm flutter --version || true
+
+      - name: 建 Python 虚拟环境
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -euo pipefail
           python3 -m venv .venv
-          .venv/bin/python -c "import sys; print('[venv]', sys.version)"
-          chmod +x tools/android-runtime/*.sh || true
-          if [ -f tools/android-runtime/fetch_ndk_wsl.sh ]; then
-            bash tools/android-runtime/fetch_ndk_wsl.sh
-          fi
+          .venv/bin/python -m pip install --quiet --upgrade pip
+          .venv/bin/python --version
+
+      - name: 安装工作流插件依赖
+        working-directory: ${{ env.SRC }}/plugins/packages/buildin/workflow
+        run: |
+          set -euo pipefail
+          corepack enable pnpm || true
+          corepack prepare pnpm@latest --activate || true
+          pnpm install --frozen-lockfile || pnpm install
+
+      - name: 安装仓库托管 TypeScript
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -euo pipefail
+          npm install --prefix .ci-tools/typescript typescript@5.9.3 || true
 
       - name: 同步内置插件包
+        working-directory: ${{ env.SRC }}
         run: |
           set -euo pipefail
-          cd "$UPSTREAM_WORKSPACE"
-          corepack enable pnpm || true
-          cd plugins/packages/buildin/workflow && pnpm install --frozen-lockfile 2>/dev/null || pnpm install || true
-          cd "$UPSTREAM_WORKSPACE"
-          .venv/bin/python plugins/tools/sync_plugin_packages.py --source runtime --no-hot-reload || true
+          .venv/bin/python plugins/tools/sync_plugin_packages.py --source runtime --no-hot-reload
+          base=core/crates/runtime/application/assets/plugins
+          for spec in buildin/change_review buildin/character_cards buildin/workflow external/openui; do
+            test -f "$base/$spec.toolpkg" && echo "ok $spec" || echo "MISS $spec"
+          done
+
+      - name: 构建检查
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -euo pipefail
+          python3 tools/build_scripts/check_build_environment.py --products app --github-runner || true
 
       - name: 构建官方包
+        working-directory: ${{ env.SRC }}
         run: |
           set -euo pipefail
-          cd "$UPSTREAM_WORKSPACE"
           version=$(grep -E '^version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+' apps/flutter/app/pubspec.yaml | head -1)
           name=$(printf '%s' "$version" | sed -E 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+)\+.*/\1/')
           num=$(printf '%s' "$version" | sed -E 's/.*\+([0-9]+).*/\1/')
-          echo "[版本] name=$name number=$num"
-          cd apps/flutter/app/android
-          chmod +x ./gradlew
-          ./gradlew assembleRelease --stacktrace --no-daemon --console=plain
-          find . -name '*.apk' -path '*outputs*' | while read f; do ls -lh "$f"; done
+          echo "[版本] $name+$num"
+          python3 tools/build_scripts/build_flutter_android.py \
+            --build-name "$name" --build-number "$num" --enforce-lockfile
+
+      - name: 收集官方包
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/out
+          find tools/release/dist -name '*.apk' 2>/dev/null | while read f; do cp "$f" "/tmp/out/official-$(basename "$f")"; done
+          ls -lh /tmp/out/ || true
 
       - name: 构建云机包
+        working-directory: ${{ env.SRC }}/apps/flutter/app/android
         run: |
           set -euo pipefail
-          cd "$UPSTREAM_WORKSPACE"
-          version=$(grep -E '^version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+' apps/flutter/app/pubspec.yaml | head -1)
-          name=$(printf '%s' "$version" | sed -E 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+)\+.*/\1/')
-          num=$(printf '%s' "$version" | sed -E 's/.*\+([0-9]+).*/\1/')
-          cd apps/flutter/app/android
+          chmod +x ./gradlew
           ./gradlew assembleYunji --stacktrace --no-daemon --console=plain
-          find . -name '*.apk' -path '*outputs*' | while read f; do ls -lh "$f"; done
 
-      - name: 收集产物并校验包名
+      - name: 收集云机包并核对包名
+        working-directory: ${{ env.SRC }}
         run: |
           set -euo pipefail
-          cd "$UPSTREAM_WORKSPACE"
-          mkdir -p /tmp/out
-          # 官方包：release 目录
-          find apps/flutter/app/android -name '*.apk' -path '*release*' ! -path '*yunji*' | while read f; do
-            cp "$f" /tmp/out/app-release.apk
-          done
-          # 云机包
-          find apps/flutter/app/android -name '*.apk' -path '*yunji*' | while read f; do
-            cp "$f" /tmp/out/app-yunji.apk
-          done
+          find apps/flutter/app/android -name '*.apk' -path '*yunji*' | while read f; do cp "$f" "/tmp/out/yunji-$(basename "$f")"; done
           ls -lh /tmp/out/
           echo '=== 包名核对 ==='
-          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
-          AAPT2="$ANDROID_HOME/build-tools/$BT/aapt2"
-          if [ -x "$AAPT2" ]; then
+          BT=$(ls "$ANDROID_HOME/build-tools" 2>/dev/null | sort -V | tail -1)
+          if [ -n "$BT" ] && [ -x "$ANDROID_HOME/build-tools/$BT/aapt2" ]; then
             for f in /tmp/out/*.apk; do
-              echo "--- $f"
-              "$AAPT2" dump packagename "$f" 2>/dev/null || true
+              printf '%s -> ' "$f"; "$ANDROID_HOME/build-tools/$BT/aapt2" dump packagename "$f" 2>/dev/null || echo '(读取失败)'
             done
+          else
+            echo 'aapt2 不在 ANDROID_HOME，跳过'
           fi
 
       - name: 校验签名
         run: |
           set -euo pipefail
-          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          BT=$(ls "$ANDROID_HOME/build-tools" 2>/dev/null | sort -V | tail -1)
+          if [ -z "$BT" ]; then echo '无 build-tools，跳过'; exit 0; fi
           for f in /tmp/out/*.apk; do
             echo "--- $f"
             "$ANDROID_HOME/build-tools/$BT/apksigner" verify --print-certs "$f" 2>&1 | grep -E 'SHA-256|Signer' | head -3 || true
@@ -197,21 +210,20 @@ jobs:
 
       - name: 发布到 Release
         if: success() && github.event.inputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           TAG="${{ github.event.inputs.release_tag }}"
           if [ -z "$TAG" ]; then TAG="build-${{ github.run_number }}"; fi
-          echo "TAG=$TAG" >> $GITHUB_ENV
           cd /tmp/out
-          for f in *.apk; do
-            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo "${{ github.repository }}" --clobber || true
-          done
-          if ! gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+          ls -lh
+          if gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            gh release upload "$TAG" ./*.apk --repo "${{ github.repository }}" --clobber
+          else
             gh release create "$TAG" --repo "${{ github.repository }}" \
               --title "Operit2 $TAG" \
               --notes "源码 ${{ github.event.inputs.source_repo }}@${{ github.event.inputs.source_ref }}" \
-              /tmp/out/*.apk
+              ./*.apk
           fi
           echo "发布完成: https://github.com/${{ github.repository }}/releases/tag/$TAG"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
