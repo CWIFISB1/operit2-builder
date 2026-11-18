@@ -84,9 +84,13 @@ jobs:
             ca-certificates curl git unzip xz-utils gzip tar bzip2 \
             gawk pkg-config flex diffutils patch \
             python3 python3-venv python3-pip \
-            openjdk-17-jdk nodejs npm corepack
+            openjdk-17-jdk nodejs npm
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
           node --version
+          npm --version
+          # corepack 不在 Ubuntu 的 apt 源里，官方分发方式是 npm 全局安装。
+          sudo npm install -g corepack@latest 2>&1 | tail -3
+          corepack --version
 
       - name: 安装 LLVM 21
         run: |
@@ -108,15 +112,17 @@ jobs:
           rustc --version
           rustup target add aarch64-linux-android
 
-      - name: 安装 FVM 与项目 Flutter
-        working-directory: ${{ env.SRC }}
+      - name: 安装 Flutter SDK
         run: |
           set -euo pipefail
-          export PATH="$HOME/.pub-cache/bin:$PATH"
-          dart pub global activate fvm
-          echo "$HOME/.pub-cache/bin" >> $GITHUB_PATH
-          fvm install || true
-          fvm flutter --version || true
+          # fvm 需要先有 dart，而 dart 又来自 flutter，链条太长且易断；
+          # 直接取 stable 分支的 Flutter，版本由 pubspec 的 sdk 约束把关。
+          git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$HOME/flutter"
+          echo "$HOME/flutter/bin" >> $GITHUB_PATH
+          export PATH="$HOME/flutter/bin:$PATH"
+          flutter --version
+          flutter config --no-analytics
+          flutter precache --android 2>&1 | tail -3
 
       - name: 建 Python 虚拟环境
         working-directory: ${{ env.SRC }}
