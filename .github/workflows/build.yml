@@ -225,6 +225,22 @@ jobs:
           keytool -list -v -keystore tools/release/secrets/operit2-release.keystore \
             -storepass "$KEYSTORE_PASS" 2>/dev/null | grep -E 'SHA256:' | head -1
 
+      - name: Install Emscripten for usearch wasm
+        run: |
+          # 上游在 11-07 之后把 resources/usearch.wasm 从仓库移除，改为构建时现场编译。
+          # build.py 的查找顺序：EMXX → PATH 上的 em++ → .ci-tools/emsdk/upstream/emscripten/em++.py
+          # 版本必须用 4.0.14（上游 edge/boards/esp32/editor/README.md 指定）：
+          # latest(7.x) 的 libc++ 已移除 std::is_pod 与 std::uncaught_exceptions，usearch 会编译失败。
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git .ci-tools/emsdk
+          cd .ci-tools/emsdk
+          ./emsdk install 4.0.14
+          ./emsdk activate 4.0.14
+          EMXX_PATH="$(pwd)/upstream/emscripten/em++"
+          test -x "$EMXX_PATH"
+          echo "EMXX=$EMXX_PATH" >> "$GITHUB_ENV"
+          echo "$(pwd)/upstream/emscripten" >> "$GITHUB_PATH"
+          "$EMXX_PATH" --version | head -1
+
       - name: Cache source-built Android V8
         uses: actions/cache@v4
         with:
