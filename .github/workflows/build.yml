@@ -8,7 +8,7 @@ on:
         required: true
         default: 'CWIFISB1/Operit2'
       source_ref:
-        description: '源码分支/tag/commit'
+        description: '源码 ref'
         required: true
         default: 'main'
       publish_release:
@@ -17,235 +17,282 @@ on:
         default: true
         type: boolean
       release_tag:
-        description: 'Release 标签（留空自动用 build-<run_number>）'
+        description: 'Release 标签（留空自动）'
         required: false
         default: ''
-
-concurrency:
-  group: build-${{ github.event.inputs.source_repo }}-${{ github.event.inputs.source_ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: write
 
 env:
-  SRC: operit2-src
-  PYTHONUTF8: '1'
-  PYTHONIOENCODING: utf-8
+  WORKSPACE: operit2-src
 
 jobs:
-  android:
+  build-android-runtime:
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: operit2-src
     steps:
-      - name: 检出源码
+      - name: Checkout upstream Operit2
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.inputs.source_repo }}
           ref: ${{ github.event.inputs.source_ref }}
           token: ${{ secrets.SOURCE_TOKEN }}
-          path: ${{ env.SRC }}
-          fetch-depth: 1
+          path: operit2-src
 
-      - name: 环境自检
-        working-directory: ${{ env.SRC }}
+      - name: Install Android runtime build tools
         run: |
-          set -euo pipefail
-          echo "[版本]"; grep -E '^version:' apps/flutter/app/pubspec.yaml || true
-          echo "[云机 buildType 主包]"; grep -n 'create("yunji")' apps/flutter/app/android/app/build.gradle.kts
-          echo "[云机包名]"; grep -n 'com.yunjing.companion' apps/flutter/app/android/app/build.gradle.kts | head -4
-          echo "[伴生包 buildType]"; grep -n 'create("yunji")' tools/android-accessibility/build.gradle.kts
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison build-essential bzip2 ca-certificates curl diffutils \
+            flex gawk gzip patch pkg-config tar unzip xz-utils
 
-      - name: 恢复固定签名
-        working-directory: ${{ env.SRC }}
+      - name: Checkout build patches
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: main
+          path: build-patches
+
+      # samba.org 的镜像在 CI 里一直 504/503，上游脚本无重试也无备用源。
+      # 这份补丁加了重试与 talloc 镜像，下载后仍校验 SHA256，替换不了内容。
+      - name: Apply patched source downloader
+        run: |
+          cp ../build-patches/patches/android-runtime/fetch_sources.ps1 \
+             tools/android-runtime/fetch_sources.ps1
+          grep -q Mirrors tools/android-runtime/fetch_sources.ps1
+
+      - name: Fetch Android runtime sources
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/android-runtime/fetch_sources.ps1
+
+      - name: Fetch Android NDK
+        run: bash tools/android-runtime/fetch_ndk_wsl.sh
+
+      - name: Build Android terminal runtime
+        run: |
+          export ANDROID_NDK_HOME="$HOME/.cache/operit-android-runtime/android-ndk-r29-beta4"
+          bash tools/android-runtime/build_android_tools_wsl.sh
+          bash tools/android-runtime/build_alpine_rootfs_wsl.sh
+
+      - name: Upload Android terminal runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: operit2-android-runtime-${{ github.sha }}
+          path: |
+            operit2-src/apps/flutter/app/android/app/src/main/jniLibs/arm64-v8a/libbash.so
+            operit2-src/apps/flutter/app/android/app/src/main/jniLibs/arm64-v8a/liboperit_busybox.so
+            operit2-src/apps/flutter/app/android/app/src/main/jniLibs/arm64-v8a/liboperit_loader.so
+            operit2-src/apps/flutter/app/android/app/src/main/jniLibs/arm64-v8a/liboperit_proot.so
+            operit2-src/apps/flutter/app/android/app/src/main/assets/android-runtime/arm64-v8a/rootfs.tar.gz.bin
+            operit2-src/apps/flutter/app/android/app/src/main/assets/android-runtime/arm64-v8a/rootfs.tar.gz.bin.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  build-android:
+    needs: build-android-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+        working-directory: operit2-src
+    env:
+      RUSTFLAGS: -Awarnings
+      RUST_TOOLCHAIN_VERSION: 1.95.0
+      FVM_VERSION: 4.3.0
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - name: Checkout upstream Operit2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.source_repo }}
+          ref: ${{ github.event.inputs.source_ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: operit2-src
+
+      - name: Download Android terminal runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: operit2-android-runtime-${{ github.sha }}
+          path: operit2-src/apps/flutter/app/android/app/src/main
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang cmake curl ninja-build pkg-config python3-venv unzip zip lld \
+            libclang-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev \
+            libgtk-3-dev libayatana-appindicator3-dev liblzma-dev \
+            libwebkit2gtk-4.1-dev gcc-aarch64-linux-gnu libc6-dev-arm64-cross musl-tools
+
+      - name: Install LLVM 21
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/noble llvm-toolchain-noble-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y llvm-21-dev libclang-21-dev
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libclang-21.so.21 /usr/lib/llvm-21/lib/libclang.so.21
+          ls -l /usr/lib/llvm-21/lib/libclang.so.21
+
+      - name: Configure libclang search path
+        run: |
+          echo "OPERIT_LIBCLANG_DIR=/usr/lib/llvm-21/lib" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=/usr/lib/llvm-21/lib" >> "$GITHUB_ENV"
+
+      - name: Install bootstrap Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 3.11.5
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable corepack pnpm shim
+        run: |
+          corepack enable pnpm
+          command -v pnpm
+          pnpm --version
+
+      - name: Install built-in workflow plugin dependencies
+        working-directory: operit2-src/plugins/packages/buildin/workflow
+        run: |
+          corepack pnpm install --frozen-lockfile
+          for module in esbuild fflate typescript; do
+            test -d "node_modules/$module" || { echo "missing $module" >&2; exit 1; }
+          done
+
+      - name: Create repository Python virtual environment
+        run: |
+          python3 -m venv .venv
+          test -x .venv/bin/python
+          .venv/bin/python --version
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install repository-managed TypeScript compiler
+        run: |
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
+          test -x .ci-tools/typescript/node_modules/.bin/tsc
+          .ci-tools/typescript/node_modules/.bin/tsc --version
+
+      - name: Install FVM
+        run: |
+          dart pub global activate fvm $FVM_VERSION
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+
+      - name: Install project Flutter SDK
+        working-directory: operit2-src/apps/flutter/app
+        run: fvm install --skip-pub-get
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: aarch64-linux-android
+
+      - name: Restore Android signing material
         env:
           KEYSTORE_B64: ${{ secrets.O2_KEYSTORE_B64 }}
           KEYSTORE_PASS: ${{ secrets.O2_KEYSTORE_PASS }}
           KEYSTORE_ALIAS: ${{ secrets.O2_KEYSTORE_ALIAS }}
         run: |
-          set -euo pipefail
+          for name in KEYSTORE_B64 KEYSTORE_PASS KEYSTORE_ALIAS; do
+            if [ -z "${!name}" ]; then
+              echo "Missing required secret: $name" >&2; exit 1
+            fi
+          done
           mkdir -p tools/release/secrets
-          echo "$KEYSTORE_B64" | base64 -d > tools/release/secrets/operit2-release.jks
-          keytool -list -keystore tools/release/secrets/operit2-release.jks -storepass "$KEYSTORE_PASS" > /dev/null
-          {
-            echo "RELEASE_STORE_FILE=$GITHUB_WORKSPACE/$SRC/tools/release/secrets/operit2-release.jks"
-            echo "RELEASE_STORE_PASSWORD=$KEYSTORE_PASS"
-            echo "RELEASE_KEY_ALIAS=$KEYSTORE_ALIAS"
-            echo "RELEASE_KEY_PASSWORD=$KEYSTORE_PASS"
-          } >> local.properties
-          echo '[签名就绪]'
-          keytool -list -v -keystore tools/release/secrets/operit2-release.jks -storepass "$KEYSTORE_PASS" 2>/dev/null | grep -E 'SHA256:' | head -1
+          echo "$KEYSTORE_B64" | base64 -d > tools/release/secrets/operit2-release.keystore
+          printf 'RELEASE_STORE_FILE=operit2-release.keystore\nRELEASE_STORE_PASSWORD=%s\nRELEASE_KEY_ALIAS=%s\nRELEASE_KEY_PASSWORD=%s\n' \
+            "$KEYSTORE_PASS" "$KEYSTORE_ALIAS" "$KEYSTORE_PASS" \
+            > tools/release/secrets/android-signing.properties
+          keytool -list -keystore tools/release/secrets/operit2-release.keystore \
+            -storepass "$KEYSTORE_PASS" > /dev/null
+          keytool -list -v -keystore tools/release/secrets/operit2-release.keystore \
+            -storepass "$KEYSTORE_PASS" 2>/dev/null | grep -E 'SHA256:' | head -1
 
-      - name: 安装 Linux 构建依赖
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            ca-certificates curl git unzip xz-utils gzip tar bzip2 \
-            gawk pkg-config flex diffutils patch \
-            python3 python3-venv python3-pip \
-            openjdk-17-jdk nodejs npm
-          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
-          node --version
-          npm --version
-          # corepack 不在 Ubuntu 的 apt 源里，官方分发方式是 npm 全局安装。
-          sudo npm install -g corepack@latest 2>&1 | tail -3
-          corepack --version
+      - name: Cache source-built Android V8
+        uses: actions/cache@v4
+        with:
+          path: tools/release/work/android-v8
+          key: ${{ runner.os }}-${{ runner.arch }}-android-v8-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
 
-      - name: 安装 LLVM 21
-        run: |
-          set -euo pipefail
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
-            | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/noble llvm-toolchain-noble-21 main" \
-            | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang-21 libclang-21-dev lld-21
-          clang-21 --version | head -1
+      - name: Check build environment
+        run: python3 tools/build_scripts/check_build_environment.py --products app --github-runner
 
-      - name: 安装 Rust
+      - name: Sync builtin plugin packages
         run: |
-          set -euo pipefail
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-          . "$HOME/.cargo/env"
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          rustc --version
-          rustup target add aarch64-linux-android
-
-      - name: 安装 Flutter SDK
-        run: |
-          set -euo pipefail
-          # fvm 需要先有 dart，而 dart 又来自 flutter，链条太长且易断；
-          # 直接取 stable 分支的 Flutter，版本由 pubspec 的 sdk 约束把关。
-          git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$HOME/flutter"
-          echo "$HOME/flutter/bin" >> $GITHUB_PATH
-          export PATH="$HOME/flutter/bin:$PATH"
-          flutter --version
-          flutter config --no-analytics
-          flutter precache --android 2>&1 | tail -3
-
-      - name: 安装 Emscripten（usearch wasm 需要）
-        working-directory: ${{ env.SRC }}
-        run: |
-          set -euo pipefail
-          # character_cards 插件的 vendor/usearch 在 pack:toolpkg 阶段要编 wasm，
-          # 缺 em++ 会直接 FileNotFoundError，整个插件同步失败。
-          # 上游查找顺序：.ci-tools/emsdk 或环境变量 EMXX。
-          git clone --depth 1 https://github.com/emscripten-core/emsdk.git .ci-tools/emsdk
-          cd .ci-tools/emsdk
-          ./emsdk install latest
-          ./emsdk activate latest
-          set +u
-          source ./emsdk_env.sh
-          set -u
-          # build.py 优先读 EMXX，其次找 ROOT/.ci-tools/emsdk/upstream/emscripten/em++.py。
-          # 这里两个都落实：EMXX 指向确切路径，emsdk 也装在它默认找的位置。
-          EMXX_PATH="$(pwd)/upstream/emscripten/em++"
-          test -x "$EMXX_PATH" || { echo "em++ not found at $EMXX_PATH" >&2; exit 1; }
-          echo "EMXX=$EMXX_PATH" >> $GITHUB_ENV
-          echo "$(pwd)/upstream/emscripten" >> $GITHUB_PATH
-          "$EMXX_PATH" --version | head -1
-
-      - name: 建 Python 虚拟环境
-        working-directory: ${{ env.SRC }}
-        run: |
-          set -euo pipefail
-          python3 -m venv .venv
-          .venv/bin/python -m pip install --quiet --upgrade pip
-          .venv/bin/python --version
-
-      - name: 安装工作流插件依赖
-        working-directory: ${{ env.SRC }}/plugins/packages/buildin/workflow
-        run: |
-          set -euo pipefail
-          corepack enable pnpm || true
-          corepack prepare pnpm@latest --activate || true
-          pnpm install --frozen-lockfile || pnpm install
-
-      - name: 安装仓库托管 TypeScript
-        working-directory: ${{ env.SRC }}
-        run: |
-          set -euo pipefail
-          npm install --prefix .ci-tools/typescript typescript@5.9.3 || true
-
-      - name: 同步内置插件包
-        working-directory: ${{ env.SRC }}
-        run: |
-          set -euo pipefail
           .venv/bin/python plugins/tools/sync_plugin_packages.py --source runtime --no-hot-reload
           base=core/crates/runtime/application/assets/plugins
+          for collection in buildin external; do
+            test -d "$base/$collection" || { echo "missing $base/$collection" >&2; exit 1; }
+          done
           for spec in buildin/change_review buildin/character_cards buildin/workflow external/openui; do
-            test -f "$base/$spec.toolpkg" && echo "ok $spec" || echo "MISS $spec"
+            test -f "$base/$spec.toolpkg" || { echo "missing self-packed archive: $base/$spec.toolpkg" >&2; exit 1; }
+            echo "self-packed ok: $spec"
           done
 
-      - name: 构建检查
-        working-directory: ${{ env.SRC }}
+      - name: Build official APK
         run: |
-          set -euo pipefail
-          python3 tools/build_scripts/check_build_environment.py --products app --github-runner || true
-
-      - name: 构建官方包
-        working-directory: ${{ env.SRC }}
-        run: |
-          set -euo pipefail
-          version=$(grep -E '^version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+' apps/flutter/app/pubspec.yaml | head -1)
-          name=$(printf '%s' "$version" | sed -E 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+)\+.*/\1/')
-          num=$(printf '%s' "$version" | sed -E 's/.*\+([0-9]+).*/\1/')
-          echo "[版本] $name+$num"
+          version=$(grep -E '^version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+' apps/flutter/app/pubspec.yaml)
+          count=$(printf '%s\n' "$version" | grep -c .)
+          if [ "$count" -ne 1 ]; then
+            echo "pubspec.yaml must contain exactly one release version line" >&2; exit 1
+          fi
+          build_name=$(printf '%s' "$version" | sed -E 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+)\+.*/\1/')
+          build_number=$(printf '%s' "$version" | sed -E 's/.*\+([0-9]+).*/\1/')
           python3 tools/build_scripts/build_flutter_android.py \
-            --build-name "$name" --build-number "$num" --enforce-lockfile
-
-      - name: 收集官方包
-        working-directory: ${{ env.SRC }}
-        run: |
-          set -euo pipefail
+            --build-name "$build_name" --build-number "$build_number" --enforce-lockfile
           mkdir -p /tmp/out
-          find tools/release/dist -name '*.apk' 2>/dev/null | while read f; do cp "$f" "/tmp/out/official-$(basename "$f")"; done
-          ls -lh /tmp/out/ || true
+          cp tools/release/dist/operit2-app-android-arm64-v8a-*.apk /tmp/out/app-official.apk
 
-      - name: 构建云机包
-        working-directory: ${{ env.SRC }}/apps/flutter/app/android
+      - name: Build yunji APK
+        working-directory: operit2-src/apps/flutter/app/android
         run: |
-          set -euo pipefail
           chmod +x ./gradlew
           ./gradlew assembleYunji --stacktrace --no-daemon --console=plain
 
-      - name: 收集云机包并核对包名
-        working-directory: ${{ env.SRC }}
+      - name: Collect and verify
         run: |
-          set -euo pipefail
-          find apps/flutter/app/android -name '*.apk' -path '*yunji*' | while read f; do cp "$f" "/tmp/out/yunji-$(basename "$f")"; done
+          mkdir -p /tmp/out
+          find apps/flutter/app/android -name '*.apk' -path '*yunji*' | while read f; do
+            cp "$f" /tmp/out/app-yunji.apk
+          done
           ls -lh /tmp/out/
-          echo '=== 包名核对 ==='
           BT=$(ls "$ANDROID_HOME/build-tools" 2>/dev/null | sort -V | tail -1)
-          if [ -n "$BT" ] && [ -x "$ANDROID_HOME/build-tools/$BT/aapt2" ]; then
-            for f in /tmp/out/*.apk; do
-              printf '%s -> ' "$f"; "$ANDROID_HOME/build-tools/$BT/aapt2" dump packagename "$f" 2>/dev/null || echo '(读取失败)'
-            done
-          else
-            echo 'aapt2 不在 ANDROID_HOME，跳过'
-          fi
-
-      - name: 校验签名
-        run: |
-          set -euo pipefail
-          BT=$(ls "$ANDROID_HOME/build-tools" 2>/dev/null | sort -V | tail -1)
-          if [ -z "$BT" ]; then echo '无 build-tools，跳过'; exit 0; fi
+          echo "=== 包名核对 ==="
           for f in /tmp/out/*.apk; do
-            echo "--- $f"
-            "$ANDROID_HOME/build-tools/$BT/apksigner" verify --print-certs "$f" 2>&1 | grep -E 'SHA-256|Signer' | head -3 || true
+            printf '%s -> ' "$(basename "$f")"
+            "$ANDROID_HOME/build-tools/$BT/aapt2" dump packagename "$f" 2>/dev/null || echo "(读取失败)"
+          done
+          echo "=== 签名核对 ==="
+          for f in /tmp/out/*.apk; do
+            echo "--- $(basename "$f")"
+            "$ANDROID_HOME/build-tools/$BT/apksigner" verify --print-certs "$f" 2>&1 | grep -E 'SHA-256' | head -1 || true
           done
 
-      - name: 发布到 Release
+      - name: Publish release
         if: success() && github.event.inputs.publish_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
           TAG="${{ github.event.inputs.release_tag }}"
           if [ -z "$TAG" ]; then TAG="build-${{ github.run_number }}"; fi
-          cd /tmp/out
-          ls -lh
+          cd /tmp/out && ls -lh
           if gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
             gh release upload "$TAG" ./*.apk --repo "${{ github.repository }}" --clobber
           else
@@ -254,4 +301,4 @@ jobs:
               --notes "源码 ${{ github.event.inputs.source_repo }}@${{ github.event.inputs.source_ref }}" \
               ./*.apk
           fi
-          echo "发布完成: https://github.com/${{ github.repository }}/releases/tag/$TAG"
+          echo "完成: https://github.com/${{ github.repository }}/releases/tag/$TAG"
