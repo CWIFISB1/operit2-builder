@@ -277,17 +277,31 @@ jobs:
           cp tools/release/dist/operit2-app-android-arm64-v8a-*.apk /tmp/out/app-official.apk
 
       - name: Build yunji APK
-        working-directory: operit2-src/apps/flutter/app/android
         run: |
-          chmod +x ./gradlew
-          ./gradlew assembleYunji --stacktrace --no-daemon --console=plain
-
+          set -euo pipefail
+          # 云机包与官方包走同一条 flutter build 路径，只多一个属性开关，
+          # 因此 Dart AOT、assets、插件打包全部复用官方流程，不会缺任务。
+          # 包名由 build.gradle.kts 里的 operitYunjiMode 在配置阶段换掉：
+          #   主包   app.operit                -> com.yunjing.companion
+          #   伴生包 app.operit.accessibility  -> com.yunjing.companion.accessibility
+          version=$(grep -E '^version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+' apps/flutter/app/pubspec.yaml)
+          build_name=$(printf '%s' "$version" | sed -E 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+)\+.*/\1/')
+          build_number=$(printf '%s' "$version" | sed -E 's/.*\+([0-9]+).*/\1/')
+          cd apps/flutter/app
+          fvm flutter build apk --release \
+            --target-platform android-arm64 \
+            --android-project-arg=operitYunjiMode=true \
+            --build-name "$build_name" --build-number "$build_number"
       - name: Collect and verify
         run: |
+          set -euo pipefail
           mkdir -p /tmp/out
-          find apps/flutter/app/android -name '*.apk' -path '*yunji*' | while read f; do
-            cp "$f" /tmp/out/app-yunji.apk
-          done
+          # 两次 flutter build 都会写入同一个 release 输出目录，
+          # 所以云机包构建前先把官方包挪走（已在 Build official APK 里复制到 /tmp/out）。
+          ls -lh /tmp/out/
+          echo "=== 云机包来源 ==="
+          ls -lh apps/flutter/app/build/app/outputs/flutter-apk/ 2>/dev/null || true
+          cp apps/flutter/app/build/app/outputs/flutter-apk/app-release.apk /tmp/out/app-yunji.apk
           ls -lh /tmp/out/
           BT=$(ls "$ANDROID_HOME/build-tools" 2>/dev/null | sort -V | tail -1)
           echo "=== 包名核对 ==="
