@@ -324,7 +324,7 @@ jobs:
         if: always() && steps.v8-restore.outputs.hit == 'false'
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
         run: |
           set -uo pipefail
           DIR=tools/release/work/android-v8
