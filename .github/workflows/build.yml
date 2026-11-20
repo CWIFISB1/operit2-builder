@@ -326,7 +326,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           DIR=tools/release/work/android-v8
           if [ ! -f "$DIR/manifest.json" ]; then
             echo "[v8] 本轮未产出 manifest.json，跳过上传"
