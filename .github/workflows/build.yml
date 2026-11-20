@@ -243,11 +243,53 @@ jobs:
           echo "$(pwd)/upstream/emscripten" >> "$GITHUB_PATH"
           "$EMXX_PATH" --version | head -1
 
+      # actions/cache 的 save 只在 job 正常结束时执行，实测 Post 步骤报 success
+      # 但仓库 caches 恒为 0（total_count=0），V8 缓存从未真正落地，于是每轮都
+      # 从源码重编 60~90 分钟。改走 release 资产：产物只有 3 个文件加 manifest，
+      # 预编译一次后永久复用，prepare_android_v8.py 的 cache_valid() 会自然跳过编译。
+      - name: Restore V8 from release
+        id: v8-restore
+        shell: bash
+        run: |
+          set -uo pipefail
+          H=$(sha256sum tools/build_scripts/prepare_android_v8.py \
+                        apps/flutter/native/operit-flutter-bridge/Cargo.lock \
+              | sha256sum | cut -c1-16)
+          echo "hash=$H" >> "$GITHUB_OUTPUT"
+          ASSET="android-v8-$H.tar.gz"
+          URL="https://github.com/CWIFISB1/operit-build/releases/download/prebuilt-deps/$ASSET"
+          echo "[v8] probe $ASSET"
+          if curl -fsSL -o /tmp/v8.tar.gz "$URL"; then
+            mkdir -p tools/release/work/android-v8
+            tar -xzf /tmp/v8.tar.gz -C tools/release/work/android-v8
+            rm -f /tmp/v8.tar.gz
+            echo "[v8] restored from release"
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "[v8] no prebuilt asset, will compile from source"
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Cache source-built Android V8
         uses: actions/cache@v4
         with:
           path: tools/release/work/android-v8
           key: ${{ runner.os }}-${{ runner.arch }}-android-v8-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
+
+      # Gradle 构建缓存。实测日志显示 assembleDebug + assembleYunji 一次跑要 47 分钟，
+      # 而 GitHub 托管 runner 在第 47 分钟附近会被回收（注解恒为 The operation was canceled），
+      # 连续四次全部断在 dexBuilderYunji。把 ~/.gradle/caches 持久化后，
+      # 第二轮起增量编译只需十几分钟，稳定落在安全窗口内。
+      - name: Cache Gradle build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/caches/build-cache-1
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('src/**/*.gradle*', 'src/gradle.properties', 'src/gradle/wrapper/gradle-wrapper.properties', 'src/gradle/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
 
       - name: Check build environment
         run: python3 tools/build_scripts/check_build_environment.py --products app --github-runner
@@ -278,6 +320,32 @@ jobs:
           mkdir -p /tmp/out
           cp tools/release/dist/operit2-app-android-arm64-v8a-*.apk /tmp/out/app-official.apk
 
+      - name: Publish V8 to release
+        if: always() && steps.v8-restore.outputs.hit == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          DIR=tools/release/work/android-v8
+          if [ ! -f "$DIR/manifest.json" ]; then
+            echo "[v8] 本轮未产出 manifest.json，跳过上传"
+            exit 0
+          fi
+          H="${{ steps.v8-restore.outputs.hash }}"
+          ASSET="android-v8-$H.tar.gz"
+          tar -czf "/tmp/$ASSET" -C "$DIR" .
+          echo "[v8] packed $(stat -c%s "/tmp/$ASSET") bytes"
+          gh release view prebuilt-deps --repo CWIFISB1/operit-build >/dev/null 2>&1 \
+            || gh release create prebuilt-deps --repo CWIFISB1/operit-build \
+                 --title 'prebuilt deps' --notes 'Android prebuilt deps and V8 static libs'
+          if gh release view prebuilt-deps --repo CWIFISB1/operit-build \
+               --json assets --jq '.assets[].name' | grep -qx "$ASSET"; then
+            echo "[v8] $ASSET exists, skip"
+          else
+            gh release upload prebuilt-deps "/tmp/$ASSET" --repo CWIFISB1/operit-build --clobber
+            echo "[v8] uploaded $ASSET"
+          fi
       - name: Build yunji APK
         run: |
           set -euo pipefail
@@ -294,6 +362,11 @@ jobs:
             --target-platform android-arm64 \
             --android-project-arg=operitYunjiMode=true \
             --build-name "$build_name" --build-number "$build_number"
+
+      # V8 从源码编译一次约 60~90 分钟，是 O2 构建时间的主要来源。本轮若发生了
+      # 真实编译（Restore 步骤未命中），就地把产物打包上传到 release，下一轮
+      # Restore 直接命中、prepare_android_v8.py 的 cache_valid() 跳过编译，
+      # 总时长可压到 60 分钟以内。只传 3 个文件加 manifest，体积可控。
       - name: Collect and verify
         run: |
           set -euo pipefail
