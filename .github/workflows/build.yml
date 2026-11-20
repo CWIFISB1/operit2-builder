@@ -327,15 +327,26 @@ jobs:
           GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
         run: |
           set -euo pipefail
-          DIR=tools/release/work/android-v8
-          if [ ! -f "$DIR/manifest.json" ]; then
-            echo "[v8] 本轮未产出 manifest.json，跳过上传"
+          # 旧版按固定路径判断 manifest.json，文件不在那儿就静默 exit 0，
+          # 表现为「0 秒 success 但资产没落地」。改为直接找真实产物：
+          # 只要 librusty_v8.a 存在就算本轮编出来了，其所在目录整体打包。
+          FOUND=$(find . -name 'librusty_v8.a' -not -path '*/target/debug/*' 2>/dev/null | head -1)
+          if [ -z "$FOUND" ]; then
+            echo "[v8] 本轮没产出 librusty_v8.a，跳过上传"
             exit 0
           fi
+          DIR=$(dirname "$FOUND")
+          echo "[v8] found $FOUND in $DIR"
+          ls -la "$DIR" | head -20
           H="${{ steps.v8-restore.outputs.hash }}"
+          if [ -z "$H" ]; then
+            H=$(sha256sum tools/build_scripts/prepare_android_v8.py \
+                  apps/flutter/native/operit-flutter-bridge/Cargo.lock 2>/dev/null \
+                | sha256sum | cut -c1-16)
+          fi
           ASSET="android-v8-$H.tar.gz"
           tar -czf "/tmp/$ASSET" -C "$DIR" .
-          echo "[v8] packed $(stat -c%s "/tmp/$ASSET") bytes"
+          echo "[v8] packed $(stat -c%s "/tmp/$ASSET") bytes as $ASSET"
           gh release view prebuilt-deps --repo CWIFISB1/operit-build >/dev/null 2>&1 \
             || gh release create prebuilt-deps --repo CWIFISB1/operit-build \
                  --title 'prebuilt deps' --notes 'Android prebuilt deps and V8 static libs'
