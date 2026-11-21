@@ -291,6 +291,19 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
+      # 缓存 Rust native 编译产物。实测 assembleRelease 单次 ~91 分钟，主因是
+      # cargoBuildOperitFlutterBridge 每轮对 operit-flutter-bridge 全量重编
+      # （target/ 目录从未进缓存，且 CARGO_INCREMENTAL=0）。缓存 target/ 后，
+      # 未变更的依赖 crate 直接复用 fingerprint，Rust 段可从 ~90 分钟降到个位分钟级。
+      - name: Cache Rust native build
+        uses: actions/cache@v4
+        with:
+          path: |
+            apps/flutter/native/operit-flutter-bridge/target
+          key: rust-native-${{ runner.os }}-${{ hashFiles('apps/flutter/native/operit-flutter-bridge/Cargo.lock', 'apps/flutter/app/android/app/build.gradle.kts') }}
+          restore-keys: |
+            rust-native-${{ runner.os }}-
+
       - name: Check build environment
         run: python3 tools/build_scripts/check_build_environment.py --products app --github-runner
 
